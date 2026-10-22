@@ -7,7 +7,7 @@ The workflow `.github/workflows/rotate-age.yml` checks daily and rotates when 30
 Open **Settings → Secrets and variables → Actions → New repository secret** and add:
 
 - `AGE_CURRENT_KEY`: the current age secret-key line (from your existing `drop.age.key` file). Paste only the `AGE-SECRET-KEY-...` line; never commit it.
-- `ROTATION_ADMIN_TOKEN`: a fine-grained GitHub personal access token restricted to this repository, with **Contents: Read and write** and **Actions: Read and write** permissions. The workflow uses it to push updates (so Pages deploys) and update `AGE_CURRENT_KEY`.
+- `ROTATION_ADMIN_TOKEN`: a fine-grained GitHub personal access token restricted to this repository, with **Contents: Read and write** and **Secrets: Read and write** permissions. The workflow uses it to push updates (so Pages deploys) and update `AGE_CURRENT_KEY`.
 - `TELEGRAM_BOT_TOKEN`: the token from Telegram's official `@BotFather`.
 - `TELEGRAM_CHAT_ID`: your private numeric chat ID with that bot.
 
