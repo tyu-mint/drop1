@@ -1,0 +1,198 @@
+name: Rotate age key
+
+on:
+  schedule:
+    # Check daily; rotate when at least 30 days have elapsed.
+    - cron: "17 4 * * *"
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Force a rotation now (even if 30 days have not elapsed)"
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: age-key-rotation
+  cancel-in-progress: false
+
+jobs:
+  rotate:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Check whether rotation is due
+        id: due
+        env:
+          FORCE_ROTATION: ${{ inputs.force }}
+        run: |
+          python3 - <<'PY'
+          import datetime, json, os
+          from pathlib import Path
+
+          state = json.loads(Path("rotation-state.json").read_text())
+          last = datetime.date.fromisoformat(state["last_rotated"])
+          today = datetime.datetime.now(datetime.timezone.utc).date()
+          force = os.environ.get("FORCE_ROTATION", "").lower() == "true"
+          due = force or (today - last).days >= 30
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(f"due={'true' if due else 'false'}\n")
+          print("Rotation is due." if due else "Rotation is not due; no changes made.")
+          PY
+
+      - name: Install age and PyNaCl
+        if: steps.due.outputs.due == 'true'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y age
+          python3 -m pip install --quiet --disable-pip-version-check pynacl
+
+      - name: Decrypt current config and prepare new key
+        if: steps.due.outputs.due == 'true'
+        env:
+          AGE_CURRENT_KEY: ${{ secrets.AGE_CURRENT_KEY }}
+        run: |
+          set -euo pipefail
+          test -n "$AGE_CURRENT_KEY" || { echo "Missing AGE_CURRENT_KEY repository secret."; exit 1; }
+          printf '%s\n' "$AGE_CURRENT_KEY" > "$RUNNER_TEMP/age-current.key"
+          chmod 600 "$RUNNER_TEMP/age-current.key"
+          age -d -i "$RUNNER_TEMP/age-current.key" -o "$RUNNER_TEMP/config.yaml" drop.yaml
+          age-keygen -o "$RUNNER_TEMP/age-new.key" >/dev/null 2>&1
+          chmod 600 "$RUNNER_TEMP/age-new.key"
+          grep -q '^AGE-SECRET-KEY-' "$RUNNER_TEMP/age-new.key"
+          age-keygen -y "$RUNNER_TEMP/age-current.key" > "$RUNNER_TEMP/current.pub"
+          age-keygen -y "$RUNNER_TEMP/age-new.key" > "$RUNNER_TEMP/new.pub"
+          age -r "$(cat "$RUNNER_TEMP/current.pub")" -r "$(cat "$RUNNER_TEMP/new.pub")" \
+            -o "$RUNNER_TEMP/drop.yaml" "$RUNNER_TEMP/config.yaml"
+          # Verify both the existing and the new key can decrypt the result.
+          age -d -i "$RUNNER_TEMP/age-current.key" -o "$RUNNER_TEMP/check-old.yaml" "$RUNNER_TEMP/drop.yaml"
+          age -d -i "$RUNNER_TEMP/age-new.key" -o "$RUNNER_TEMP/check-new.yaml" "$RUNNER_TEMP/drop.yaml"
+          cmp "$RUNNER_TEMP/config.yaml" "$RUNNER_TEMP/check-old.yaml"
+          cmp "$RUNNER_TEMP/config.yaml" "$RUNNER_TEMP/check-new.yaml"
+          echo "Encrypted config verified with both keys."
+
+      - name: Publish dual-recipient encrypted config
+        if: steps.due.outputs.due == 'true'
+        env:
+          ROTATION_ADMIN_TOKEN: ${{ secrets.ROTATION_ADMIN_TOKEN }}
+        run: |
+          set -euo pipefail
+          test -n "$ROTATION_ADMIN_TOKEN" || { echo "Missing ROTATION_ADMIN_TOKEN repository secret."; exit 1; }
+          cp "$RUNNER_TEMP/drop.yaml" drop.yaml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add drop.yaml
+          git commit -m "Rotate age recipient; retain previous key for transition"
+          git remote set-url origin "https://x-access-token:${ROTATION_ADMIN_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          git push origin HEAD:main
+
+      - name: Update current key and deliver it privately
+        if: steps.due.outputs.due == 'true'
+        env:
+          ROTATION_ADMIN_TOKEN: ${{ secrets.ROTATION_ADMIN_TOKEN }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          AGE_CURRENT_KEY: ${{ secrets.AGE_CURRENT_KEY }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_API_URL: ${{ github.api_url }}
+        run: |
+          set -euo pipefail
+          export NEW_AGE_KEY="$(grep '^AGE-SECRET-KEY-' "$RUNNER_TEMP/age-new.key")"
+          python3 - <<'PY'
+          import base64, json, os, sys, urllib.error, urllib.request
+          from nacl.public import PublicKey, SealedBox
+
+          repo = os.environ["GITHUB_REPOSITORY"]
+          api = os.environ["GITHUB_API_URL"].rstrip("/")
+          token = os.environ["ROTATION_ADMIN_TOKEN"]
+          old_key = os.environ["AGE_CURRENT_KEY"]
+          new_key = os.environ["NEW_AGE_KEY"]
+          bot = os.environ["TELEGRAM_BOT_TOKEN"]
+          chat = os.environ["TELEGRAM_CHAT_ID"]
+
+          def request(url, method="GET", body=None, bearer=token):
+              data = None if body is None else json.dumps(body).encode()
+              req = urllib.request.Request(url, data=data, method=method, headers={
+                  "Authorization": "Bearer " + bearer,
+                  "Accept": "application/vnd.github+json",
+                  "X-GitHub-Api-Version": "2022-11-28",
+                  "Content-Type": "application/json",
+                  "User-Agent": "drop1-age-rotation"
+              })
+              with urllib.request.urlopen(req, timeout=20) as response:
+                  raw = response.read()
+                  return json.loads(raw) if raw else {}
+
+          def set_current_key(value):
+              pub = request(f"{api}/repos/{repo}/actions/secrets/public-key")
+              sealed = SealedBox(PublicKey(base64.b64decode(pub["key"]))).encrypt(value.encode())
+              request(f"{api}/repos/{repo}/actions/secrets/AGE_CURRENT_KEY", "PUT", {
+                  "encrypted_value": base64.b64encode(sealed).decode(),
+                  "key_id": pub["key_id"]
+              })
+
+          try:
+              set_current_key(new_key)
+          except Exception:
+              print("Could not update AGE_CURRENT_KEY; encrypted file still accepts the old key.")
+              sys.exit(1)
+
+          text = (
+              "drop1 age 密钥已轮换。请把客户端中的 age 私钥更新为下面的新密钥：\n\n"
+              + new_key
+              + "\n\n原订阅地址不变：https://tyu-mint.github.io/drop1/drop.yaml"
+              + "\n旧密钥会在下一次轮换时退出；请在 30 天内完成客户端更新。"
+          )
+          payload = json.dumps({"chat_id": chat, "text": text}).encode()
+          req = urllib.request.Request(
+              f"https://api.telegram.org/bot{bot}/sendMessage",
+              data=payload,
+              headers={"Content-Type": "application/json"},
+              method="POST"
+          )
+          try:
+              with urllib.request.urlopen(req, timeout=20) as response:
+                  result = json.loads(response.read())
+              if result.get("ok") is not True:
+                  raise RuntimeError("Telegram rejected message")
+          except Exception:
+              # Roll back active key so the next daily run can safely retry.
+              try:
+                  set_current_key(old_key)
+              except Exception:
+                  print("Telegram delivery failed and key rollback also failed; inspect repository secrets immediately.")
+                  sys.exit(2)
+              print("Telegram delivery failed; active key rolled back and old key remains usable.")
+              sys.exit(1)
+
+          print("New key delivered privately through Telegram.")
+          PY
+
+      - name: Record successful rotation date
+        if: steps.due.outputs.due == 'true'
+        env:
+          ROTATION_ADMIN_TOKEN: ${{ secrets.ROTATION_ADMIN_TOKEN }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import datetime, json
+          from pathlib import Path
+          Path("rotation-state.json").write_text(json.dumps({
+              "last_rotated": datetime.datetime.now(datetime.timezone.utc).date().isoformat()
+          }, indent=2) + "\n")
+          PY
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add rotation-state.json
+          git commit -m "Record successful age key rotation"
+          git remote set-url origin "https://x-access-token:${ROTATION_ADMIN_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          git push origin HEAD:main
