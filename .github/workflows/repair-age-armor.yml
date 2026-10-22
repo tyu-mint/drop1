@@ -1,0 +1,71 @@
+name: Repair age armor format
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: age-armor-repair
+  cancel-in-progress: false
+
+jobs:
+  repair:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install age
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y age
+
+      - name: Re-encrypt as ASCII-armored age
+        env:
+          AGE_CURRENT_KEY: ${{ secrets.AGE_CURRENT_KEY }}
+          AGE_PREVIOUS_KEY: ${{ secrets.AGE_PREVIOUS_KEY }}
+        run: |
+          set -euo pipefail
+          test -n "$AGE_CURRENT_KEY" || { echo "Missing AGE_CURRENT_KEY repository secret."; exit 1; }
+          printf '%s\n' "$AGE_CURRENT_KEY" > "$RUNNER_TEMP/current.key"
+          chmod 600 "$RUNNER_TEMP/current.key"
+          age -d -i "$RUNNER_TEMP/current.key" -o "$RUNNER_TEMP/config.yaml" drop.yaml
+          age-keygen -y "$RUNNER_TEMP/current.key" > "$RUNNER_TEMP/current.pub"
+
+          if [ -n "${AGE_PREVIOUS_KEY:-}" ]; then
+            printf '%s\n' "$AGE_PREVIOUS_KEY" > "$RUNNER_TEMP/previous.key"
+            chmod 600 "$RUNNER_TEMP/previous.key"
+            age-keygen -y "$RUNNER_TEMP/previous.key" > "$RUNNER_TEMP/previous.pub"
+            age -a -r "$(cat "$RUNNER_TEMP/current.pub")" -r "$(cat "$RUNNER_TEMP/previous.pub")" \
+              -o "$RUNNER_TEMP/drop.yaml" "$RUNNER_TEMP/config.yaml"
+            age -d -i "$RUNNER_TEMP/previous.key" -o "$RUNNER_TEMP/check-previous.yaml" "$RUNNER_TEMP/drop.yaml"
+            cmp "$RUNNER_TEMP/config.yaml" "$RUNNER_TEMP/check-previous.yaml"
+          else
+            age -a -r "$(cat "$RUNNER_TEMP/current.pub")" \
+              -o "$RUNNER_TEMP/drop.yaml" "$RUNNER_TEMP/config.yaml"
+          fi
+
+          age -d -i "$RUNNER_TEMP/current.key" -o "$RUNNER_TEMP/check-current.yaml" "$RUNNER_TEMP/drop.yaml"
+          cmp "$RUNNER_TEMP/config.yaml" "$RUNNER_TEMP/check-current.yaml"
+          grep -q '^-----BEGIN AGE ENCRYPTED FILE-----$' "$RUNNER_TEMP/drop.yaml"
+          echo "ASCII-armored encrypted config verified."
+
+      - name: Publish repaired subscription
+        env:
+          ROTATION_ADMIN_TOKEN: ${{ secrets.ROTATION_ADMIN_TOKEN }}
+        run: |
+          set -euo pipefail
+          test -n "$ROTATION_ADMIN_TOKEN" || { echo "Missing ROTATION_ADMIN_TOKEN repository secret."; exit 1; }
+          cp "$RUNNER_TEMP/drop.yaml" drop.yaml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add drop.yaml
+          git commit -m "Repair age subscription armor format"
+          git remote set-url origin "https://x-access-token:${ROTATION_ADMIN_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          git push origin HEAD:main
