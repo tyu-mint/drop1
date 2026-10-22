@@ -71,7 +71,7 @@ jobs:
           grep -q '^AGE-SECRET-KEY-' "$RUNNER_TEMP/age-new.key"
           age-keygen -y "$RUNNER_TEMP/age-current.key" > "$RUNNER_TEMP/current.pub"
           age-keygen -y "$RUNNER_TEMP/age-new.key" > "$RUNNER_TEMP/new.pub"
-          age -r "$(cat "$RUNNER_TEMP/current.pub")" -r "$(cat "$RUNNER_TEMP/new.pub")" \
+          age -a -r "$(cat "$RUNNER_TEMP/current.pub")" -r "$(cat "$RUNNER_TEMP/new.pub")" \
             -o "$RUNNER_TEMP/drop.yaml" "$RUNNER_TEMP/config.yaml"
           # Verify both the existing and the new key can decrypt the result.
           age -d -i "$RUNNER_TEMP/age-current.key" -o "$RUNNER_TEMP/check-old.yaml" "$RUNNER_TEMP/drop.yaml"
