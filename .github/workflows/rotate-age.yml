@@ -193,6 +193,10 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add rotation-state.json
+          if git diff --cached --quiet; then
+            echo "Rotation date is already recorded; no state commit needed."
+            exit 0
+          fi
           git commit -m "Record successful age key rotation"
           git remote set-url origin "https://x-access-token:${ROTATION_ADMIN_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
           git push origin HEAD:main
